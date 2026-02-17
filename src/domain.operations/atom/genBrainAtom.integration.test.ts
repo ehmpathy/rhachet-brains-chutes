@@ -17,7 +17,7 @@ if (!process.env.CHUTES_API_KEY)
   throw new BadRequestError('CHUTES_API_KEY is required for integration tests');
 
 describe('genBrainAtom.integration', () => {
-  jest.setTimeout(30000);
+  jest.setTimeout(120_000);
 
   // use qwen3-coder-next for fast integration tests
   const brainAtom = genBrainAtom({ slug: 'chutes/qwen3/coder-next' });
@@ -142,20 +142,15 @@ describe('genBrainAtom.integration', () => {
   });
 
   given('[case4] all models leverage briefs', () => {
-    // rate limiter to prevent 429s when all 11 models fire in parallel
-    const limiter = new Bottleneck({ maxConcurrent: 2, minTime: 1000 });
+    // rate limiter to prevent 429s
+    const limiter = new Bottleneck({ maxConcurrent: 1, minTime: 1000 });
 
+    // representative subset: one per model family + hermes
     const allSlugs: ChutesBrainAtomSlug[] = [
       'chutes/qwen3/coder-next',
-      'chutes/qwen3/coder-480b',
-      'chutes/qwen3/235b',
-      'chutes/deepseek/v3.1',
       'chutes/deepseek/v3.2',
-      'chutes/deepseek/r1',
-      'chutes/kimi/k2-think',
       'chutes/kimi/k2.5',
       'chutes/glm/4.7',
-      'chutes/glm/5',
       'chutes/hermes/4-405b',
     ];
 

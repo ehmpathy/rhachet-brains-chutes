@@ -74,6 +74,7 @@ export const genBrainAtom = (input: {
         new OpenAI({
           apiKey: process.env.CHUTES_API_KEY,
           baseURL: 'https://llm.chutes.ai/v1/',
+          timeout: 60_000,
         });
 
       // build messages array with prior exchanges for continuation
