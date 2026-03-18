@@ -1,6 +1,7 @@
 import Bottleneck from 'bottleneck';
 import { BadRequestError } from 'helpful-errors';
 import path from 'path';
+import type { BrainPlugToolDefinition } from 'rhachet/brains';
 import { genArtifactGitFile } from 'rhachet-artifact-git';
 import { given, then, useThen, when } from 'test-fns';
 import { z } from 'zod';
@@ -178,5 +179,222 @@ describe('genBrainAtom.integration', () => {
         });
       });
     }
+  });
+
+  given('[case5] tool invocation', () => {
+    // define a calculator tool
+    const calculatorTool: BrainPlugToolDefinition = {
+      slug: 'calculator.multiply',
+      name: 'Calculator Multiply',
+      description: 'Multiplies two numbers together',
+      schema: {
+        input: z.object({
+          a: z.number().describe('First number'),
+          b: z.number().describe('Second number'),
+        }),
+        output: z.object({ result: z.number() }),
+      },
+    };
+
+    when('[t0] brain is asked to multiply with tool available', () => {
+      const result = useThen('it requests the tool', async () =>
+        brainAtom.ask({
+          role: {},
+          prompt:
+            'Call the calculator tool to multiply 7 times 8. You must call the tool.',
+          plugs: { tools: [calculatorTool] },
+          schema: { output: outputSchema },
+        }),
+      );
+
+      then('output is null', () => {
+        expect(result.output).toBeNull();
+      });
+
+      then('calls.tools is defined', () => {
+        expect(result.calls).toBeDefined();
+        expect(result.calls?.tools).toBeDefined();
+        expect(result.calls?.tools?.length).toBeGreaterThan(0);
+      });
+
+      then('tool call has correct slug', () => {
+        expect(result.calls?.tools?.[0]?.slug).toEqual('calculator.multiply');
+      });
+
+      then('tool call has input parameters', () => {
+        const input = result.calls?.tools?.[0]?.input as {
+          a: number;
+          b: number;
+        };
+        expect(input).toBeDefined();
+        expect(typeof input.a).toEqual('number');
+        expect(typeof input.b).toEqual('number');
+      });
+
+      then('episode is returned', () => {
+        expect(result.episode).toBeDefined();
+        expect(result.episode.exchanges).toHaveLength(1);
+      });
+    });
+  });
+
+  given('[case6] tool continuation', () => {
+    const calculatorTool: BrainPlugToolDefinition = {
+      slug: 'calculator.multiply',
+      name: 'Calculator Multiply',
+      description: 'Multiplies two numbers together',
+      schema: {
+        input: z.object({
+          a: z.number().describe('First number'),
+          b: z.number().describe('Second number'),
+        }),
+        output: z.object({ result: z.number() }),
+      },
+    };
+
+    when('[t0] tool result is fed back', () => {
+      // first call: brain requests tool
+      const resultFirst = useThen('brain requests tool', async () =>
+        brainAtom.ask({
+          role: {},
+          prompt:
+            'Call the calculator to multiply 7 times 8. You must call the tool.',
+          plugs: { tools: [calculatorTool] },
+          schema: { output: outputSchema },
+        }),
+      );
+
+      // second call: feed tool result back
+      const resultSecond = useThen('continuation succeeds', async () => {
+        const toolCall = resultFirst.calls?.tools?.[0];
+        if (!toolCall) throw new Error('no tool call in first result');
+
+        return brainAtom.ask({
+          on: { episode: resultFirst.episode },
+          role: {},
+          prompt: [
+            {
+              exid: toolCall.exid,
+              slug: toolCall.slug,
+              input: toolCall.input,
+              signal: 'success' as const,
+              output: { result: 56 },
+              metrics: { cost: { time: { milliseconds: 1 } } },
+            },
+          ],
+          plugs: { tools: [calculatorTool] },
+          schema: { output: outputSchema },
+        });
+      });
+
+      then('final output is populated', () => {
+        expect(resultSecond.output).toBeDefined();
+        expect(resultSecond.output).not.toBeNull();
+      });
+
+      then('output contains the result', () => {
+        expect(resultSecond.output?.content).toContain('56');
+      });
+
+      then('episode has multiple exchanges', () => {
+        expect(resultSecond.episode.exchanges.length).toBeGreaterThanOrEqual(2);
+      });
+    });
+  });
+
+  given('[case8] metrics with tools', () => {
+    const calculatorTool: BrainPlugToolDefinition = {
+      slug: 'calculator.add',
+      name: 'Calculator Add',
+      description: 'Adds two numbers',
+      schema: {
+        input: z.object({ a: z.number(), b: z.number() }),
+        output: z.object({ result: z.number() }),
+      },
+    };
+
+    when('[t0] tool call is made', () => {
+      const result = useThen('tool is requested', async () =>
+        brainAtom.ask({
+          role: {},
+          prompt: 'Call the calculator to add 5 and 3. You must call the tool.',
+          plugs: { tools: [calculatorTool] },
+          schema: { output: outputSchema },
+        }),
+      );
+
+      then('metrics is defined', () => {
+        expect(result.metrics).toBeDefined();
+      });
+
+      then('metrics includes time cost', () => {
+        expect(result.metrics.cost.time).toBeDefined();
+      });
+
+      then('metrics includes token counts', () => {
+        expect(result.metrics.size.tokens.input).toBeGreaterThan(0);
+        expect(result.metrics.size.tokens.output).toBeGreaterThan(0);
+      });
+    });
+  });
+
+  given('[case9] tool error signal', () => {
+    const calculatorTool: BrainPlugToolDefinition = {
+      slug: 'calculator.divide',
+      name: 'Calculator Divide',
+      description: 'Divides first number by second',
+      schema: {
+        input: z.object({ a: z.number(), b: z.number() }),
+        output: z.object({ result: z.number() }),
+      },
+    };
+
+    when('[t0] tool returns error', () => {
+      // first call: brain requests tool
+      const resultFirst = useThen('brain requests tool', async () =>
+        brainAtom.ask({
+          role: {},
+          prompt:
+            'Call the calculator to divide 10 by 0. You must call the tool.',
+          plugs: { tools: [calculatorTool] },
+          schema: { output: outputSchema },
+        }),
+      );
+
+      // second call: feed error back
+      const resultSecond = useThen('error is handled', async () => {
+        const toolCall = resultFirst.calls?.tools?.[0];
+        if (!toolCall) throw new Error('no tool call in first result');
+
+        return brainAtom.ask({
+          on: { episode: resultFirst.episode },
+          role: {},
+          prompt: [
+            {
+              exid: toolCall.exid,
+              slug: toolCall.slug,
+              input: toolCall.input,
+              signal: 'error:constraint' as const,
+              output: { error: new Error('Division by zero is not allowed') },
+              metrics: { cost: { time: { milliseconds: 1 } } },
+            },
+          ],
+          plugs: { tools: [calculatorTool] },
+          schema: { output: outputSchema },
+        });
+      });
+
+      then('brain continues gracefully', () => {
+        // brain should either provide output or request different tool call
+        const hasOutput = resultSecond.output !== null;
+        const hasToolCalls = (resultSecond.calls?.tools?.length ?? 0) > 0;
+        expect(hasOutput || hasToolCalls).toBe(true);
+      });
+
+      then('episode is preserved', () => {
+        expect(resultSecond.episode).toBeDefined();
+        expect(resultSecond.episode.exchanges.length).toBeGreaterThanOrEqual(2);
+      });
+    });
   });
 });
