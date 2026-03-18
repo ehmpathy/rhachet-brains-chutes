@@ -1,10 +1,11 @@
 import OpenAI from 'openai';
 import {
   BrainAtom,
-  type BrainAtomPlugs,
   type BrainEpisode,
   BrainOutput,
   BrainOutputMetrics,
+  type BrainPlugs,
+  type BrainPlugToolExecution,
   calcBrainOutputCost,
   castBriefsToPrompt,
   genBrainContinuables,
@@ -14,6 +15,9 @@ import type { GitFile } from 'rhachet-artifact-git';
 import type { Empty } from 'type-fns';
 import { z } from 'zod';
 
+import { castFromChutesToolCall } from '../../infra/cast/castFromChutesToolCall';
+import { castIntoChutesToolDef } from '../../infra/cast/castIntoChutesToolDef';
+import { castIntoChutesToolMessages } from '../../infra/cast/castIntoChutesToolMessages';
 import {
   type ChutesBrainAtomSlug,
   CONFIG_BY_ATOM_SLUG,
@@ -45,21 +49,22 @@ export const genBrainAtom = (input: {
     spec: config.spec,
 
     /**
-     * .what = stateless inference (no tool use)
+     * .what = stateless inference with optional tool use
      * .why = provides direct model access for tasks
      *
      * .note = supports continuation via `on.episode`
+     * .note = supports tool use via `plugs.tools`
      */
-    ask: async <TOutput>(
+    ask: async <TOutput, TPlugs extends BrainPlugs = BrainPlugs>(
       askInput: {
         on?: { episode: BrainEpisode };
-        plugs?: BrainAtomPlugs;
+        plugs?: TPlugs;
         role: { briefs?: Artifact<typeof GitFile>[] };
-        prompt: string;
+        prompt: string | BrainPlugToolExecution[];
         schema: { output: z.Schema<TOutput> };
       },
       context?: Empty,
-    ): Promise<BrainOutput<TOutput, 'atom'>> => {
+    ): Promise<BrainOutput<TOutput, 'atom', TPlugs>> => {
       // track start time for elapsed duration
       const startedAt = Date.now();
 
@@ -88,31 +93,66 @@ export const genBrainAtom = (input: {
           messages.push({ role: 'assistant', content: exchange.output });
         }
       }
-      messages.push({ role: 'user', content: askInput.prompt });
+
+      // build prompt messages based on type (string vs tool executions)
+      const promptMessages: OpenAI.ChatCompletionMessageParam[] = (() => {
+        if (typeof askInput.prompt === 'string') {
+          return [{ role: 'user' as const, content: askInput.prompt }];
+        }
+        // prompt is tool execution results - cast to openai messages
+        return castIntoChutesToolMessages({
+          executions: askInput.prompt as BrainPlugToolExecution[],
+        });
+      })();
+      messages.push(...promptMessages);
 
       // convert zod schema to json schema for structured output
       const jsonSchema = z.toJSONSchema(askInput.schema.output);
 
-      // call chutes api with strict json_schema response format
+      // detect if this is a tool continuation (prompt is tool execution results)
+      const isToolContinuation = Array.isArray(askInput.prompt);
+
+      // build tools parameter if tools are plugged and not a continuation
+      // (on continuation, model should produce final output, not call more tools)
+      const hasTools = askInput.plugs?.tools?.length;
+      const toolsParam =
+        hasTools && !isToolContinuation
+          ? {
+              tools: askInput.plugs!.tools!.map((tool) =>
+                castIntoChutesToolDef({ tool }),
+              ),
+              tool_choice: 'auto' as const,
+            }
+          : {};
+
+      // build response_format when no tools OR when in continuation mode
+      // (json_schema and tool calls are mutually exclusive in model behavior)
+      const shouldUseResponseFormat = !hasTools || isToolContinuation;
+      const responseFormatParam = shouldUseResponseFormat
+        ? {
+            response_format: {
+              type: 'json_schema' as const,
+              json_schema: {
+                name: 'response',
+                strict: true,
+                schema: jsonSchema,
+              },
+            },
+          }
+        : {};
+
+      // call chutes api
       const response = await openai.chat.completions.create({
         model: config.model,
         messages,
-        response_format: {
-          type: 'json_schema',
-          json_schema: {
-            name: 'response',
-            strict: true,
-            schema: jsonSchema,
-          },
-        },
+        ...toolsParam,
+        ...responseFormatParam,
       });
 
-      // extract content from response
-      const content = response.choices[0]?.message?.content ?? '';
-
-      // parse JSON response and validate via schema
-      const parsed = JSON.parse(content);
-      const output = askInput.schema.output.parse(parsed);
+      // extract message from response
+      const message = response.choices[0]?.message;
+      const content = message?.content ?? '';
+      const toolCalls = message?.tool_calls;
 
       // calculate elapsed time
       const elapsedMs = Date.now() - startedAt;
@@ -128,7 +168,11 @@ export const genBrainAtom = (input: {
         )?.prompt_tokens_details?.cached_tokens ?? 0;
 
       // calculate character counts
-      const charsInput = (systemPrompt?.length ?? 0) + askInput.prompt.length;
+      const promptLength =
+        typeof askInput.prompt === 'string'
+          ? askInput.prompt.length
+          : JSON.stringify(askInput.prompt).length;
+      const charsInput = (systemPrompt?.length ?? 0) + promptLength;
       const charsOutput = content.length;
 
       // define size for metrics and cost calculation
@@ -160,21 +204,54 @@ export const genBrainAtom = (input: {
         },
       });
 
+      // determine exchange input/output for continuables
+      const exchangeInput =
+        typeof askInput.prompt === 'string'
+          ? askInput.prompt
+          : JSON.stringify(askInput.prompt);
+      const exchangeOutput = toolCalls?.length
+        ? JSON.stringify(toolCalls)
+        : content;
+
       // build continuables (episode + series) for this invocation
       const { episode, series } = await genBrainContinuables({
         for: { grain: 'atom' },
         on: { episode: askInput.on?.episode ?? null, series: null },
         with: {
           exchange: {
-            input: askInput.prompt,
-            output: content,
+            input: exchangeInput,
+            output: exchangeOutput,
             exid: response.id ?? null,
           },
           episode: { exid: response.id ?? null },
         },
       });
 
-      return new BrainOutput({ output, metrics, episode, series });
+      // if tool calls present, return with calls and null output
+      if (toolCalls?.length) {
+        const toolInvocations = toolCalls.map((call) =>
+          castFromChutesToolCall({ call }),
+        );
+        return new BrainOutput({
+          output: null,
+          calls: { tools: toolInvocations } as any,
+          metrics,
+          episode,
+          series,
+        }) as BrainOutput<TOutput, 'atom', TPlugs>;
+      }
+
+      // parse JSON response and validate via schema
+      const parsed = JSON.parse(content);
+      const output = askInput.schema.output.parse(parsed);
+
+      return new BrainOutput({
+        output,
+        calls: null as any,
+        metrics,
+        episode,
+        series,
+      }) as BrainOutput<TOutput, 'atom', TPlugs>;
     },
   });
 };
