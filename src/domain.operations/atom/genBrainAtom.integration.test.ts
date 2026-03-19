@@ -14,6 +14,9 @@ const BRIEFS_DIR = path.join(TEST_ASSETS_DIR, '/example.briefs');
 
 const outputSchema = z.object({ content: z.string() });
 
+// tool use requires z.string() schema (vllm cannot do structured output + tool calls together)
+const toolOutputSchema = z.string();
+
 if (!process.env.CHUTES_API_KEY)
   throw new BadRequestError('CHUTES_API_KEY is required for integration tests');
 
@@ -22,6 +25,9 @@ describe('genBrainAtom.integration', () => {
 
   // use qwen3-coder-next for fast integration tests
   const brainAtom = genBrainAtom({ slug: 'chutes/qwen3/coder-next' });
+
+  // use kimi/k2.5 for tool use tests (good tool call capability)
+  const brainAtomWithTools = genBrainAtom({ slug: 'chutes/kimi/k2.5' });
 
   given('[case1] genBrainAtom({ slug: "chutes/qwen3/coder-next" })', () => {
     when('[t0] atom is created', () => {
@@ -198,12 +204,12 @@ describe('genBrainAtom.integration', () => {
 
     when('[t0] brain is asked to multiply with tool available', () => {
       const result = useThen('it requests the tool', async () =>
-        brainAtom.ask({
+        brainAtomWithTools.ask({
           role: {},
           prompt:
             'Call the calculator tool to multiply 7 times 8. You must call the tool.',
           plugs: { tools: [calculatorTool] },
-          schema: { output: outputSchema },
+          schema: { output: toolOutputSchema },
         }),
       );
 
@@ -255,12 +261,12 @@ describe('genBrainAtom.integration', () => {
     when('[t0] tool result is fed back', () => {
       // first call: brain requests tool
       const resultFirst = useThen('brain requests tool', async () =>
-        brainAtom.ask({
+        brainAtomWithTools.ask({
           role: {},
           prompt:
             'Call the calculator to multiply 7 times 8. You must call the tool.',
           plugs: { tools: [calculatorTool] },
-          schema: { output: outputSchema },
+          schema: { output: toolOutputSchema },
         }),
       );
 
@@ -269,7 +275,7 @@ describe('genBrainAtom.integration', () => {
         const toolCall = resultFirst.calls?.tools?.[0];
         if (!toolCall) throw new Error('no tool call in first result');
 
-        return brainAtom.ask({
+        return brainAtomWithTools.ask({
           on: { episode: resultFirst.episode },
           role: {},
           prompt: [
@@ -283,7 +289,7 @@ describe('genBrainAtom.integration', () => {
             },
           ],
           plugs: { tools: [calculatorTool] },
-          schema: { output: outputSchema },
+          schema: { output: toolOutputSchema },
         });
       });
 
@@ -293,7 +299,7 @@ describe('genBrainAtom.integration', () => {
       });
 
       then('output contains the result', () => {
-        expect(resultSecond.output?.content).toContain('56');
+        expect(resultSecond.output).toContain('56');
       });
 
       then('episode has multiple exchanges', () => {
@@ -315,11 +321,11 @@ describe('genBrainAtom.integration', () => {
 
     when('[t0] tool call is made', () => {
       const result = useThen('tool is requested', async () =>
-        brainAtom.ask({
+        brainAtomWithTools.ask({
           role: {},
           prompt: 'Call the calculator to add 5 and 3. You must call the tool.',
           plugs: { tools: [calculatorTool] },
-          schema: { output: outputSchema },
+          schema: { output: toolOutputSchema },
         }),
       );
 
@@ -352,12 +358,12 @@ describe('genBrainAtom.integration', () => {
     when('[t0] tool returns error', () => {
       // first call: brain requests tool
       const resultFirst = useThen('brain requests tool', async () =>
-        brainAtom.ask({
+        brainAtomWithTools.ask({
           role: {},
           prompt:
             'Call the calculator to divide 10 by 0. You must call the tool.',
           plugs: { tools: [calculatorTool] },
-          schema: { output: outputSchema },
+          schema: { output: toolOutputSchema },
         }),
       );
 
@@ -366,7 +372,7 @@ describe('genBrainAtom.integration', () => {
         const toolCall = resultFirst.calls?.tools?.[0];
         if (!toolCall) throw new Error('no tool call in first result');
 
-        return brainAtom.ask({
+        return brainAtomWithTools.ask({
           on: { episode: resultFirst.episode },
           role: {},
           prompt: [
@@ -380,7 +386,7 @@ describe('genBrainAtom.integration', () => {
             },
           ],
           plugs: { tools: [calculatorTool] },
-          schema: { output: outputSchema },
+          schema: { output: toolOutputSchema },
         });
       });
 
@@ -396,5 +402,90 @@ describe('genBrainAtom.integration', () => {
         expect(resultSecond.episode.exchanges.length).toBeGreaterThanOrEqual(2);
       });
     });
+  });
+
+  given('[case10] tool use on open-source models', () => {
+    // rate limiter to prevent 429s
+    const limiter = new Bottleneck({ maxConcurrent: 1, minTime: 2000 });
+
+    const calculatorTool: BrainPlugToolDefinition = {
+      slug: 'calculator.multiply',
+      name: 'Calculator Multiply',
+      description: 'Multiplies two numbers together',
+      schema: {
+        input: z.object({
+          a: z.number().describe('First number'),
+          b: z.number().describe('Second number'),
+        }),
+        output: z.object({ result: z.number() }),
+      },
+    };
+
+    // test tool use on models that support it
+    const modelsToTest: ChutesBrainAtomSlug[] = [
+      'chutes/kimi/k2.5',
+      'chutes/glm/5',
+    ];
+
+    for (const slug of modelsToTest) {
+      when(`[${slug}] tool invocation and continuation`, () => {
+        const atom = genBrainAtom({ slug });
+
+        // first call: brain should request tool
+        const resultFirst = useThen('brain requests tool', async () =>
+          limiter.schedule(() =>
+            atom.ask({
+              role: {},
+              prompt:
+                'Call the calculator tool to multiply 6 times 9. You must call the tool.',
+              plugs: { tools: [calculatorTool] },
+              schema: { output: toolOutputSchema },
+            }),
+          ),
+        );
+
+        then('tool call is returned', () => {
+          expect(resultFirst.output).toBeNull();
+          expect(resultFirst.calls?.tools).toBeDefined();
+          expect(resultFirst.calls?.tools?.length).toBeGreaterThan(0);
+          expect(resultFirst.calls?.tools?.[0]?.slug).toEqual(
+            'calculator.multiply',
+          );
+        });
+
+        // second call: feed tool result, expect text output
+        // note: uses repeatably because model output content can be flaky
+        then.repeatably({
+          attempts: 3,
+          criteria: 'SOME',
+        })('continuation returns output with result', async () => {
+          const toolCall = resultFirst.calls?.tools?.[0];
+          if (!toolCall) throw new Error('no tool call in first result');
+
+          const resultSecond = await limiter.schedule(() =>
+            atom.ask({
+              on: { episode: resultFirst.episode },
+              role: {},
+              prompt: [
+                {
+                  exid: toolCall.exid,
+                  slug: toolCall.slug,
+                  input: toolCall.input,
+                  signal: 'success' as const,
+                  output: { result: 54 },
+                  metrics: { cost: { time: { milliseconds: 1 } } },
+                },
+              ],
+              plugs: { tools: [calculatorTool] },
+              schema: { output: toolOutputSchema },
+            }),
+          );
+
+          expect(resultSecond.output).not.toBeNull();
+          expect(typeof resultSecond.output).toEqual('string');
+          expect(resultSecond.output).toContain('54');
+        });
+      });
+    }
   });
 });

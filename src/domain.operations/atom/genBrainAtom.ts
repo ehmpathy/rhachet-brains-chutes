@@ -1,3 +1,4 @@
+import { BadRequestError } from 'helpful-errors';
 import OpenAI from 'openai';
 import {
   BrainAtom,
@@ -15,6 +16,7 @@ import type { GitFile } from 'rhachet-artifact-git';
 import type { Empty } from 'type-fns';
 import { z } from 'zod';
 
+import { castContentToOutputSchema } from '../../infra/cast/castContentToOutputSchema';
 import { castFromChutesToolCall } from '../../infra/cast/castFromChutesToolCall';
 import { castIntoChutesToolDef } from '../../infra/cast/castIntoChutesToolDef';
 import { castIntoChutesToolMessages } from '../../infra/cast/castIntoChutesToolMessages';
@@ -115,6 +117,19 @@ export const genBrainAtom = (input: {
       // build tools parameter if tools are plugged and not a continuation
       // (on continuation, model should produce final output, not call more tools)
       const hasTools = askInput.plugs?.tools?.length;
+
+      // fail-fast: tools + structured output schema not supported by most models
+      // vllm constraint: "model must not generate both text and tool calls in same generation"
+      // when tools are plugged, output schema must be z.string() to allow plain text responses
+      if (hasTools && !isToolContinuation) {
+        const schemaType = jsonSchema.type;
+        if (schemaType !== 'string') {
+          throw new BadRequestError(
+            `when tools are plugged, output schema must be z.string() (found: ${schemaType}). most open-source models support either tool_calls or structured json, but not both. use z.string() and parse the response yourself if structure is needed.`,
+            { schemaType, tools: askInput.plugs?.tools?.map((t) => t.slug) },
+          );
+        }
+      }
       const toolsParam =
         hasTools && !isToolContinuation
           ? {
@@ -125,11 +140,14 @@ export const genBrainAtom = (input: {
             }
           : {};
 
-      // build response_format when no tools OR when in continuation mode
-      // (json_schema and tool calls are mutually exclusive in model behavior)
-      const shouldUseResponseFormat = !hasTools || isToolContinuation;
-      const responseFormatParam = shouldUseResponseFormat
-        ? {
+      // include response_format only when we want structured output (not tool calls)
+      // vllm constraint: "model must not generate both text and tool calls in same generation"
+      // when response_format is present, model outputs json content, not tool_calls
+      // so we omit response_format on initial tool requests to enable tool call
+      const wantsToolCalls = hasTools && !isToolContinuation;
+      const responseFormatParam = wantsToolCalls
+        ? {}
+        : {
             response_format: {
               type: 'json_schema' as const,
               json_schema: {
@@ -138,8 +156,7 @@ export const genBrainAtom = (input: {
                 schema: jsonSchema,
               },
             },
-          }
-        : {};
+          };
 
       // call chutes api
       const response = await openai.chat.completions.create({
@@ -241,9 +258,11 @@ export const genBrainAtom = (input: {
         }) as BrainOutput<TOutput, 'atom', TPlugs>;
       }
 
-      // parse JSON response and validate via schema
-      const parsed = JSON.parse(content);
-      const output = askInput.schema.output.parse(parsed);
+      // parse response content based on schema type
+      const output = castContentToOutputSchema({
+        content,
+        schema: askInput.schema.output,
+      });
 
       return new BrainOutput({
         output,
