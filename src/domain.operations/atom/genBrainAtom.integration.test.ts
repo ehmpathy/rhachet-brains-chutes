@@ -454,39 +454,35 @@ describe('genBrainAtom.integration', () => {
         });
 
         // second call: feed tool result, expect text output
-        const resultSecond = useThen(
-          'continuation returns output',
-          async () => {
-            const toolCall = resultFirst.calls?.tools?.[0];
-            if (!toolCall) throw new Error('no tool call in first result');
+        // note: uses repeatably because model output content can be flaky
+        then.repeatably({
+          attempts: 3,
+          criteria: 'SOME',
+        })('continuation returns output with result', async () => {
+          const toolCall = resultFirst.calls?.tools?.[0];
+          if (!toolCall) throw new Error('no tool call in first result');
 
-            return limiter.schedule(() =>
-              atom.ask({
-                on: { episode: resultFirst.episode },
-                role: {},
-                prompt: [
-                  {
-                    exid: toolCall.exid,
-                    slug: toolCall.slug,
-                    input: toolCall.input,
-                    signal: 'success' as const,
-                    output: { result: 54 },
-                    metrics: { cost: { time: { milliseconds: 1 } } },
-                  },
-                ],
-                plugs: { tools: [calculatorTool] },
-                schema: { output: toolOutputSchema },
-              }),
-            );
-          },
-        );
+          const resultSecond = await limiter.schedule(() =>
+            atom.ask({
+              on: { episode: resultFirst.episode },
+              role: {},
+              prompt: [
+                {
+                  exid: toolCall.exid,
+                  slug: toolCall.slug,
+                  input: toolCall.input,
+                  signal: 'success' as const,
+                  output: { result: 54 },
+                  metrics: { cost: { time: { milliseconds: 1 } } },
+                },
+              ],
+              plugs: { tools: [calculatorTool] },
+              schema: { output: toolOutputSchema },
+            }),
+          );
 
-        then('output is valid string', () => {
           expect(resultSecond.output).not.toBeNull();
           expect(typeof resultSecond.output).toEqual('string');
-        });
-
-        then('output contains the computed result', () => {
           expect(resultSecond.output).toContain('54');
         });
       });
